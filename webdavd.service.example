@@ -1,0 +1,29 @@
+# Example systemd unit. Install to /etc/systemd/system/webdavd.service.
+[Unit]
+Description=Lightweight WebDAV server (behind nginx)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=webdavd
+Group=webdavd
+# The configuration file is the only source of users and roots.
+ExecStart=/usr/local/bin/webdavd --config /etc/webdavd/config.json
+
+# Light hardening: webdavd never needs write access outside its user roots.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/srv/dav
+
+Restart=on-failure
+RestartSec=2
+
+# The whole point of the project: keep the resident set tiny.
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target
+

@@ -1,0 +1,17 @@
+{
+  "host": "127.0.0.1",
+  "port": 8080,
+  "users": [
+    {
+      "name": "alice",
+      "password_bcrypt": "$2b$12$abcdefghijklmnopqrstuu6rhbR2L7eR6YQOqvZ2jXKkLdJpZ6L2c",
+      "root": "/srv/dav/alice"
+    },
+    {
+      "name": "bob",
+      "password_bcrypt": "$2b$12$abcdefghijklmnopqrstuu6rhbR2L7eR6YQOqvZ2jXKkLdJpZ6L2c",
+      "root": "/srv/dav/bob"
+    }
+  ]
+}
+

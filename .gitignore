@@ -1,0 +1,213 @@
+# ===========================================================================
+# webdavd — complete .gitignore
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# CMake / C++ build outputs
+# ---------------------------------------------------------------------------
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+/bin/
+/lib/
+/obj/
+/_deps/
+/CMakeFiles/
+
+# CMake, Ninja, CTest generated files
+CMakeCache.txt
+CMakeUserPresets.json
+cmake_install.cmake
+install_manifest.txt
+CPackConfig.cmake
+CPackSourceConfig.cmake
+CTestTestfile.cmake
+DartConfiguration.tcl
+Testing/
+build.ninja
+rules.ninja
+.ninja_deps
+.ninja_log
+compile_commands.json
+
+# Compiled objects, libraries, binaries
+*.o
+*.obj
+*.lo
+*.slo
+*.a
+*.la
+*.lai
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+*.mod
+*.ko
+*.d
+*.dSYM/
+/webdavd
+/webdav_tests
+
+# Precompiled headers, compiler caches, diagnostics
+*.gch
+*.pch
+*.pcm
+*.plist
+*.ilk
+*.pdb
+*.idb
+*.exp
+
+# ---------------------------------------------------------------------------
+# Test, coverage, profiling, sanitizer and memcheck output
+# ---------------------------------------------------------------------------
+*.gcov
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+coverage.info
+coverage.raw.info
+cov.info
+cov_raw.info
+lcov.info
+memcheck*.log
+ctest-*.log
+*-build.log
+
+# Crash dumps
+vgcore.*
+core
+core.*
+*.core
+
+# ---------------------------------------------------------------------------
+# Local configuration, secrets and credentials
+# ---------------------------------------------------------------------------
+# Ignore local config, but keep the checked-in example.
+/config.json
+/config.*.json
+!/config.example.json
+/*.local.json
+
+# Local reverse-proxy / service configuration, keep *.example.
+/nginx.conf
+/webdavd.service
+
+# Keys, certificates and other credentials
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+/local/
+/secrets/
+
+# ---------------------------------------------------------------------------
+# Logs, runtime state and temporary files
+# ---------------------------------------------------------------------------
+*.log
+*.pid
+*.seed
+*.sock
+*.tmp
+*.temp
+/tmp/
+/temp/
+
+# ---------------------------------------------------------------------------
+# IDEs, editors and language tooling
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+.vs/
+*.code-workspace
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.opendb
+*.VC.db
+*.VC.VC.opendb
+*.ncb
+*.sdf
+*.opensdf
+*.cache
+*.meta
+*.aps
+*.swp
+*.swo
+*.swn
+*~
+.project
+.cproject
+.settings/
+.metadata/
+.kdev4/
+*.kdev4
+.ccls-cache/
+.clangd/
+.ccache/
+
+# ---------------------------------------------------------------------------
+# Python helper environments and caches
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+/venv/
+/env/
+/.env
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------------------------------------------------------------------------
+# OS metadata files
+# ---------------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+desktop.ini
+$RECYCLE.BIN/
+
+# ---------------------------------------------------------------------------
+# Local agent/tool metadata
+# ---------------------------------------------------------------------------
+/.arts/
+/.codeartsdoer/
+/.merkle-snapshot.json
+
+# ---------------------------------------------------------------------------
+# Other local artifacts and package-manager caches
+# ---------------------------------------------------------------------------
+*.bak
+*.orig
+*.rej
+*.stackdump
+*.jnilib
+*.bundle
+.fleet/
+.history/
+.cache/
+conan/
+conan.lock
+conanbuildinfo.*
+conaninfo.txt
+vcpkg_installed/

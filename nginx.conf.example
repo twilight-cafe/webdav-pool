@@ -1,0 +1,66 @@
+# Example reverse-proxy front end for webdavd.
+#
+# webdavd only speaks plain HTTP and must never be exposed directly.
+# Place this server block behind a TLS listener (listen 443 ssl; ...).
+
+upstream webdavd_backend {
+    server 127.0.0.1:8080;
+    keepalive 16;
+}
+
+# Request throttling lives here, not in webdavd.  The in-process
+# authenticator only bounds concurrent bcrypt work and backs off failures.
+limit_req_zone $binary_remote_addr zone=webdav_auth:1m rate=10r/s;
+
+server {
+    listen 8443 ssl;
+    server_name dav.example.com;
+
+    ssl_certificate     /etc/nginx/tls/fullchain.pem;
+    ssl_certificate_key /etc/nginx/tls/privkey.pem;
+
+    # WebDAV bodies can be large; nginx must not impose its own cap.
+    client_max_body_size 0;
+
+    # Stream uploads straight through instead of buffering them in nginx.
+    proxy_request_buffering off;
+    proxy_buffering off;
+
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+
+    # Long transfers (huge PUT/GET) must not be cut short.
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    send_timeout 3600s;
+
+    # Forward the client address and the headers webdavd relies on.
+    # Preserve any explicit client port for Destination host comparison.
+    proxy_set_header Host              $http_host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+
+    # These are forwarded by default, listed here to make the contract explicit:
+    #   Authorization  (Basic credentials)
+    #   Destination    (COPY / MOVE target)
+    #   Depth          (PROPFIND / COPY / MOVE)
+    #   Overwrite      (COPY / MOVE)
+    #   Translate      (Microsoft WebDAV clients)
+    #   If / If-Match / If-None-Match
+    #
+    # In particular, do NOT enable "proxy_pass_request_headers off" and do not
+    # rewrite Destination: webdavd validates it against its own configuration.
+
+    # Throttle all WebDAV requests here; webdavd only bounds concurrent
+    # bcrypt work and applies its own failure backoff.
+    location = / {
+        limit_req zone=webdav_auth burst=20 nodelay;
+        proxy_pass http://webdavd_backend;
+    }
+
+    location / {
+        limit_req zone=webdav_auth burst=20 nodelay;
+        proxy_pass http://webdavd_backend;
+    }
+}
+
