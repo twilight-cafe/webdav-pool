@@ -464,3 +464,16 @@ TEST(Fsutil, CopyTreeErrors) {
     EXPECT_EQ(rc, kTreeSymlink);
   }
 }
+
+
+TEST(Fsutil, CopyTreeRejectsNonRegularFile) {
+  const std::string dir = fresh_dir("copy_non_regular");
+  const std::string fifo = dir + "/fifo";
+  ASSERT_EQ(::mkfifo(fifo.c_str(), 0600), 0);
+
+  const webdav::Fd root = webdav::open_root_directory(dir);
+  ASSERT_TRUE(root.valid());
+  EXPECT_EQ(webdav::copy_tree(root, "fifo", root, "fifocopy", true),
+            webdav::kTreeNotRegular);
+  EXPECT_FALSE(fs::exists(dir + "/fifocopy"));
+}

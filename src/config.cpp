@@ -1,5 +1,7 @@
 #include "webdav/config.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <climits>
 #include <cerrno>
 #include <cstdio>
@@ -76,7 +78,121 @@ bool path_within(const std::string& child, const std::string& parent) {
   return child.size() == parent.size() || child[parent.size()] == '/';
 }
 
+std::string ascii_lower(std::string_view input) {
+  std::string out;
+  out.reserve(input.size());
+  for (const char c : input) {
+    out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  }
+  return out;
+}  // LCOV_EXCL_LINE
+
+std::string_view trim_ascii_ws(std::string_view text) {
+  while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) {
+    text.remove_prefix(1);
+  }
+  while (!text.empty() && (text.back() == ' ' || text.back() == '\t')) {
+    text.remove_suffix(1);
+  }
+  return text;
+}
+
+// Compares a lower-cased Origin header value against one configured rule.
+// Full origins must match exactly (modulo a trailing slash convenience);
+// bare hosts match the origin host; a leading "*." enables subdomain matching.
+bool origin_matches_rule(std::string_view origin, std::string_view raw_rule) {
+  const std::string rule = ascii_lower(trim_ascii_ws(raw_rule));
+  if (rule.empty()) {
+    return false;
+  }
+
+  if (rule.find("://") != std::string::npos) {
+    if (rule.back() == '/') {
+      return origin == std::string_view(rule).substr(0, rule.size() - 1);
+    }
+    return origin == rule;
+  }
+
+  const std::size_t scheme_end = origin.find("://");
+  if (scheme_end == std::string_view::npos || scheme_end == 0) {
+    return false;
+  }
+  const std::string_view authority = origin.substr(scheme_end + 3);
+  if (authority.empty() || authority.find_first_of("/?#@") != std::string_view::npos) {
+    return false;
+  }
+
+  std::string_view host = authority;
+  if (host.front() == '[') {
+    const std::size_t close = host.find(']');
+    if (close == std::string_view::npos) {
+      return false;
+    }
+    host = host.substr(0, close + 1);
+  } else {
+    const std::size_t colon = host.rfind(':');
+    if (colon != std::string_view::npos) {
+      host = host.substr(0, colon);
+    }
+  }
+  if (host.empty()) {
+    return false;
+  }
+
+  if (rule.size() > 2 && rule[0] == '*' && rule[1] == '.') {
+    const std::string_view suffix(rule.data() + 2, rule.size() - 2);
+    return host.size() > suffix.size() &&
+           host.compare(host.size() - suffix.size(), suffix.size(), suffix) == 0 &&
+           host[host.size() - suffix.size() - 1] == '.';
+  }
+  if (!rule.empty() && rule.front() == '[') {
+    if (rule.find("]:") == std::string::npos) {
+      return host == rule;
+    }
+    return authority == rule;
+  }
+  if (rule.find(':') != std::string::npos) {
+    return authority == rule;
+  }
+  return host == rule;
+}
+
+void parse_cors_domains(const json& entry, User& user) {
+  const json& value = entry.at("cors_domains");
+  if (!value.is_array()) {
+    fail("user '" + user.name + "': 'cors_domains' must be an array");
+  }
+  user.cors_configured = true;
+  for (const json& item : value) {
+    if (!item.is_string()) {
+      fail("user '" + user.name + "': 'cors_domains' entries must be strings");
+    }
+    std::string domain = item.get<std::string>();
+    if (domain.empty()) {
+      fail("user '" + user.name + "': 'cors_domains' entries must not be empty");
+    }
+    for (const char c : domain) {
+      if (static_cast<unsigned char>(c) < 0x20 || c == 0x7f) {
+        fail("user '" + user.name +
+             "': 'cors_domains' entries must not contain control characters");
+      }
+    }
+    user.cors_domains.push_back(std::move(domain));
+  }
+}
+
 }  // namespace
+
+bool cors_allows_origin(const User& user, std::string_view origin) {
+  const std::string lower_origin = ascii_lower(origin);
+  if (lower_origin.empty()) {
+    return false;
+  }
+  return std::any_of(user.cors_domains.begin(), user.cors_domains.end(),
+                     [&lower_origin](const std::string& rule) {
+                       return origin_matches_rule(lower_origin, rule);
+                     });
+}
 
 Config parse_config(const std::string& json_text) {
   const json doc = json::parse(json_text, nullptr, false);
@@ -133,7 +249,8 @@ Config parse_config(const std::string& json_text) {
     }
     for (auto it = entry.begin(); it != entry.end(); ++it) {
       const std::string& key = it.key();
-      if (key != "name" && key != "password_bcrypt" && key != "root") {
+      if (key != "name" && key != "password_bcrypt" && key != "root" &&
+          key != "cors_domains") {
         fail("unknown user key '" + key + "'");
       }
     }
@@ -157,6 +274,9 @@ Config parse_config(const std::string& json_text) {
       fail("user '" + user.name + "': 'password_bcrypt' must be a bcrypt hash with cost >= 10");
     }
     user.root = canonical_directory(entry.at("root").get<std::string>(), user.name);
+    if (entry.contains("cors_domains")) {
+      parse_cors_domains(entry, user);
+    }
     for (const User& existing : config.users) {
       if (existing.name == user.name) {
         fail("duplicate user name '" + user.name + "'");

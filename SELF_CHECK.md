@@ -3,7 +3,7 @@
 ## 1. 构建
 
 ```sh
-cmake --build --preset release --clean-first
+cmake --build --preset release --clean-first --parallel "$(nproc)"
 ```
 
 - 编译选项：`-Wall -Wextra -Wpedantic -Werror`
@@ -16,10 +16,27 @@ cmake --build --preset release --clean-first
 ctest --preset release
 ```
 
-- 结果：**155/155 passed**，0 failed。
+- 结果：**188/188 passed**，0 failed。
 - 覆盖的方法：OPTIONS / GET / HEAD / PUT / DELETE / MKCOL / PROPFIND /
   PROPPATCH / COPY / MOVE，以及认证、配置、HTTP 解析、文件系统故障注入、
   并发 PUT、PUT/GET 并发、中断上传清理、符号链接竞态等错误分支。
+- 身份/权限回归：配置 `name` 不要求对应系统账户；请求处理不切换系统身份，
+  文件操作始终使用启动 `webdavd` 的进程 euid/egid，并仅通过该用户预打开的
+  root 目录描述符访问其文件夹。
+- CORS 回归：每个用户可配置 `cors_domains`；允许列表精确匹配、裸域名匹配、
+  通配子域名、端口和 IPv6；未命中允许列表的 Origin 拿到正常响应（不再 403）
+  且不带任何 `Access-Control-*` 头，由浏览器按 CORS 规范自行拦截；命中时实际
+  响应与错误响应（含 401）都返回 `Access-Control-Allow-Origin`（回显静态站源）、
+  `Access-Control-Allow-Methods`、`Access-Control-Allow-Headers`、
+  `Access-Control-Expose-Headers: ETag, DAV, MS-Author-Via, Allow` 与
+  `Vary: Origin`（浏览器 JS 只能读 safelisted 头 + 该暴露列表，脚本化能力探测
+  依赖其中的 `DAV`/`Allow`）；预检（`OPTIONS` +
+  `Origin` + `Access-Control-Request-Method`）不要求认证，未命中列表时同样返回
+  204（带 `Allow`/`DAV`）但不带 CORS 头；不带 ACRM 的 `OPTIONS` + `Origin` 仍按
+  普通请求认证；预检写失败分支仍然覆盖。
+- 条件请求回归：GET/HEAD 的 `If-None-Match` 返回 304，PUT/DELETE/COPY 的
+  `If-Match`/`If-None-Match` 失败返回 412，成功 PUT 返回新 ETag；
+  支持逗号列表、空白修剪和 `If-None-Match` 弱比较。
 
 ## 3. 覆盖率
 
@@ -27,7 +44,7 @@ ctest --preset release
 ./scripts/coverage.sh
 ```
 
-- 结果：**lines: 100.0% (1878 of 1878 lines)**，`src/` + `include/` 全部行覆盖。
+- 结果：**lines: 100.0% (2137 of 2137 lines)**，`src/` + `include/` 全部行覆盖。
 - 脚本在 lcov 1.16 下运行；coverage preset 使用
   `-fprofile-update=atomic`，多线程测试不再产生 gcov negative-count /
   checksum 警告。
@@ -42,7 +59,7 @@ ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1 \
   ctest --preset asan
 ```
 
-- 结果：**155/155 passed**，0 failed。
+- 结果：**188/188 passed**，0 failed。
 - 日志中无 AddressSanitizer、LeakSanitizer 或 UBSan 报错，**0 leak**。
 
 ## 5. 内存门禁
@@ -61,7 +78,7 @@ ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1 \
 
 实测：
 
-- `/proc/<pid>/status` `VmHWM` 峰值：**5856 kB ≈ 5.7 MiB**；
+- `/proc/<pid>/status` `VmHWM` 峰值：**5876 kB ≈ 5.7 MiB**；
 - 门限：**< 10240 kB (10 MiB)**；
 - 结果：通过。
 - 空载基线：`VmRSS`/`VmHWM` **4724 kB ≈ 4.6 MiB**。
@@ -86,6 +103,21 @@ ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1 \
 - 符号链接 403；
 - 含空格、中文且 percent-encoded 的合法路径 200。
 
+CORS 专项：启动真实 `webdavd`（`cors_domains` 只列 `https://app.example.com`），
+先用 curl 逐条核对响应头，再用一个按 Fetch 规范实现「CORS check / CORS-preflight
+fetch」判定的脚本（本机未安装浏览器）验证，9/9 通过：
+
+- 预检（`PROPFIND`/`PUT` + `Authorization`/`Content-Type`/`Depth`/`If-Match`/
+  `If-None-Match`）无需凭据即获 204，且 `Allow-Origin`/`-Methods`/`-Headers`/
+  `-Expose-Headers` 全部满足浏览器判定；
+- 命中来源的 GET 200 / PUT 201 / HEAD 200 与 401 均可被浏览器读取（ETag 已暴露）；
+- 浏览器可见性（响应头过滤：safelisted ∪ `Access-Control-Expose-Headers`）：
+  带 `Authorization` 的 `OPTIONS` 探针现在能读到 `DAV: 1`、`MS-Author-Via: DAV`
+  与 `Allow`——在此之前只暴露 `ETag`，脚本化能力探测会因此误判「不是 WebDAV
+  服务器」；
+- 未命中来源：预检 204、GET 200（服务端不 403），但响应不含任何
+  `Access-Control-*`，浏览器判定失败并按规范拦截。
+
 ## 7. 路径安全与 TOCTOU 审查
 
 - 所有请求路径只做一次严格 percent-decode；拒绝 NUL、超长、空段、
@@ -104,8 +136,8 @@ ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1 \
 
 - 应用层不实现 TLS，必须部署在 nginx/其他 TLS 反向代理之后。
 - 不支持 LOCK/UNLOCK、ACL、SEARCH、versioning、dead-property 持久化。
-- 不评估 `If` / `If-Match` / `If-None-Match`，不支持 multi-range / If-Range /
-  partial PUT。
+- 不支持 `If` / `If-Range` / multi-range / partial PUT；仅评估 `If-Match` /
+  `If-None-Match`。
 - 文件名中的字面 `%` 无法访问（`%25` 被当作双重编码攻击拒绝）；
   空格、中文等按标准 percent-encoding 正常。
 - 跨设备 MOVE 的 copy fallback 或递归 COPY 失败时，目标端可能残留部分树；
@@ -117,5 +149,5 @@ ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1 \
 
 ## 9. 结论
 
-Release 构建零告警、155/155 测试通过、`src/`+`include/` 行覆盖率 100%、
+Release 构建零告警、184/184 测试通过、`src/`+`include/` 行覆盖率 100%、
 ASan/UBSan 零报错零 leak、16 并发大流量下 `VmHWM` 5.7 MiB，满足交付要求。

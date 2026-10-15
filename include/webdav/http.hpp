@@ -25,6 +25,9 @@ using ErrorCode = boost::system::error_code;
 inline constexpr std::size_t kIoBufferSize = 16 * 1024;
 inline constexpr std::size_t kMaxHeaderBytes = 16 * 1024;
 inline constexpr std::size_t kMaxControlBody = 64 * 1024;
+// Upper bound for chunked trailer bytes; trailers are outside the data body
+// and must not be allowed to pin a worker indefinitely.
+inline constexpr std::size_t kMaxTrailerBytes = 8 * 1024;
 
 std::string format_http_date(std::time_t when);
 std::string format_iso8601(std::time_t when);
@@ -71,6 +74,7 @@ class BodyReader {
   std::uint64_t remaining_{0};
   std::uint64_t total_{0};
   bool failed_{false};
+  std::size_t trailer_bytes_{0};
   std::string line_;
 };
 

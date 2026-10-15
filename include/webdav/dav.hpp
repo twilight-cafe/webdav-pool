@@ -2,7 +2,6 @@
 
 #include <string_view>
 
-#include "webdav/config.hpp"
 #include "webdav/fsutil.hpp"
 #include "webdav/http.hpp"
 
@@ -16,7 +15,6 @@ struct DavContext {
   const http::request_header<>& head;
   BodyReader& body;
   const Fd& root;
-  const User& user;
 };
 
 // Handles one authenticated request, writing the complete response.

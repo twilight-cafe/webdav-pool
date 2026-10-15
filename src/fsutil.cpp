@@ -358,6 +358,9 @@ int copy_tree(const Fd& src_parent, const std::string& src_leaf, const Fd& dst_p
   if (S_ISLNK(info.st_mode)) {
     return kTreeSymlink;
   }
+  if (!S_ISDIR(info.st_mode) && !S_ISREG(info.st_mode)) {
+    return kTreeNotRegular;
+  }
 
   if (!S_ISDIR(info.st_mode)) {
     Fd source = open_leaf(src_parent, src_leaf, O_RDONLY);

@@ -8,7 +8,8 @@ Wants=network-online.target
 Type=simple
 User=webdavd
 Group=webdavd
-# The configuration file is the only source of users and roots.
+# All filesystem operations run as this OS account. The `name` values in the
+# configuration are WebDAV logins only and do not need matching system users.
 ExecStart=/usr/local/bin/webdavd --config /etc/webdavd/config.json
 
 # Light hardening: webdavd never needs write access outside its user roots.

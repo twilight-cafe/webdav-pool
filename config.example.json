@@ -5,13 +5,14 @@
     {
       "name": "alice",
       "password_bcrypt": "$2b$12$abcdefghijklmnopqrstuu6rhbR2L7eR6YQOqvZ2jXKkLdJpZ6L2c",
-      "root": "/srv/dav/alice"
+      "root": "/srv/dav/alice",
+      "cors_domains": ["https://app.example.com", "*.internal.example"]
     },
     {
       "name": "bob",
       "password_bcrypt": "$2b$12$abcdefghijklmnopqrstuu6rhbR2L7eR6YQOqvZ2jXKkLdJpZ6L2c",
-      "root": "/srv/dav/bob"
+      "root": "/srv/dav/bob",
+      "cors_domains": ["https://admin.example.com"]
     }
   ]
 }
-

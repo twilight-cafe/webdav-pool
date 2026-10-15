@@ -42,11 +42,20 @@ server {
 
     # These are forwarded by default, listed here to make the contract explicit:
     #   Authorization  (Basic credentials)
+    #   Origin         (per-user CORS allowlist)
+    #   Access-Control-Request-Method / Access-Control-Request-Headers (CORS preflight)
     #   Destination    (COPY / MOVE target)
     #   Depth          (PROPFIND / COPY / MOVE)
     #   Overwrite      (COPY / MOVE)
     #   Translate      (Microsoft WebDAV clients)
     #   If / If-Match / If-None-Match
+    #
+    # CORS is answered by webdavd itself: an Origin outside a user's
+    # `cors_domains` still has to reach the backend, which then answers normally
+    # and merely omits the Access-Control-* headers so the browser blocks it.
+    # Never add an `if ($http_origin) { return 403; }` guard and never add your
+    # own Access-Control-* headers here: a 403 is indistinguishable, in the
+    # browser, from an unreachable server.
     #
     # In particular, do NOT enable "proxy_pass_request_headers off" and do not
     # rewrite Destination: webdavd validates it against its own configuration.

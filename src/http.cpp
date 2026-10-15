@@ -83,6 +83,8 @@ const char* reason_phrase(http::status status) {
       return "Created";
     case http::status::no_content:
       return "No Content";
+    case http::status::not_modified:
+      return "Not Modified";
     case http::status::partial_content:
       return "Partial Content";
     case http::status::multi_status:
@@ -307,6 +309,11 @@ bool BodyReader::read(char* out, std::size_t capacity, std::size_t& got) {
         }
         if (line_.empty()) {
           state_ = State::kDone;
+        } else {
+          trailer_bytes_ += line_.size() + 2;
+          if (trailer_bytes_ > kMaxTrailerBytes) {
+            return fail();
+          }
         }
         break;
       }

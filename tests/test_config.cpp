@@ -43,6 +43,12 @@ std::string config_json(const std::string& users, const std::string& extra = "")
   return "{\"host\":\"127.0.0.1\",\"port\":8080,\"users\":[" + users + "]" + extra + "}";
 }
 
+std::string user_entry_with_cors(const std::string& name, const std::string& hash,
+                                 const std::string& root, const std::string& cors_json) {
+  return "{\"name\":\"" + name + "\",\"password_bcrypt\":\"" + hash + "\",\"root\":\"" +
+         root + "\",\"cors_domains\":" + cors_json + "}";
+}
+
 void expect_error(const std::string& json, const std::string& needle) {
   try {
     (void)webdav::parse_config(json);
@@ -65,10 +71,23 @@ TEST(Config, ParsesValidConfiguration) {
   EXPECT_EQ(config.port, 8080);
   EXPECT_EQ(config.users[0].name, "alice");
   EXPECT_EQ(config.users[0].root, alice);
+  EXPECT_FALSE(config.users[0].cors_configured);
+  EXPECT_TRUE(config.users[0].cors_domains.empty());
   EXPECT_EQ(config.max_connections, 16);
   EXPECT_EQ(config.auth_max_concurrent, 2);
   EXPECT_EQ(config.auth_backoff_base_ms, 250);
   EXPECT_EQ(config.auth_backoff_max_ms, 5000);
+}
+
+TEST(Config, UserNameNeedNotBeAnOsAccount) {
+  // `name` is an application-level WebDAV login. The parser must not call
+  // getpwnam()/initgroups() or require a matching system account.
+  const std::string root = make_dir("app_level_user");
+  const std::string name = "webdav-no-such-os-account-314159";
+  const webdav::Config config = webdav::parse_config(config_json(user_entry(name, kHash, root)));
+  ASSERT_EQ(config.users.size(), 1u);
+  EXPECT_EQ(config.users[0].name, name);
+  EXPECT_EQ(config.users[0].root, root);
 }
 
 TEST(Config, AcceptsEmptyUserList) {
@@ -86,6 +105,86 @@ TEST(Config, ParsesOptionalTuningKeys) {
   EXPECT_EQ(config.auth_max_concurrent, 4);
   EXPECT_EQ(config.auth_backoff_base_ms, 100);
   EXPECT_EQ(config.auth_backoff_max_ms, 2000);
+}
+
+TEST(Config, ParsesCorsDomains) {
+  const std::string alice = make_dir("cors_alice");
+  const std::string entry = user_entry_with_cors(
+      "alice", kHash, alice,
+      "[\"https://app.example.com\",\"*.internal.example\",\"api.example.com:8443\"]");
+  const webdav::Config config = webdav::parse_config(config_json(entry));
+  ASSERT_EQ(config.users.size(), 1u);
+  const webdav::User& user = config.users[0];
+  EXPECT_TRUE(user.cors_configured);
+  ASSERT_EQ(user.cors_domains.size(), 3u);
+  EXPECT_EQ(user.cors_domains[0], "https://app.example.com");
+  EXPECT_EQ(user.cors_domains[1], "*.internal.example");
+  EXPECT_EQ(user.cors_domains[2], "api.example.com:8443");
+  EXPECT_TRUE(webdav::cors_allows_origin(user, "https://app.example.com"));
+  EXPECT_TRUE(webdav::cors_allows_origin(user, "HTTPS://APP.EXAMPLE.COM"));
+  EXPECT_TRUE(webdav::cors_allows_origin(user, "https://x.internal.example"));
+  EXPECT_TRUE(webdav::cors_allows_origin(user, "https://api.example.com:8443"));
+  EXPECT_FALSE(webdav::cors_allows_origin(user, "https://api.example.com"));
+  EXPECT_FALSE(webdav::cors_allows_origin(user, "https://evil.example"));
+}
+
+TEST(Config, EmptyCorsDomainsDeniesEveryOrigin) {
+  const std::string alice = make_dir("cors_empty_alice");
+  const std::string entry = user_entry_with_cors("alice", kHash, alice, "[]");
+  const webdav::Config config = webdav::parse_config(config_json(entry));
+  ASSERT_EQ(config.users.size(), 1u);
+  const webdav::User& user = config.users[0];
+  EXPECT_TRUE(user.cors_configured);
+  EXPECT_TRUE(user.cors_domains.empty());
+  EXPECT_FALSE(webdav::cors_allows_origin(user, "https://app.example.com"));
+  EXPECT_FALSE(webdav::cors_allows_origin(user, ""));
+}
+
+TEST(Config, CorsMatchingSemantics) {
+  const webdav::User no_policy{"alice", "hash", "/tmp"};
+  EXPECT_FALSE(webdav::cors_allows_origin(no_policy, "https://anything.example"));
+  EXPECT_FALSE(webdav::cors_allows_origin(no_policy, ""));
+
+  const webdav::User implicit_policy{"alice", "hash", "/tmp", {"app.example.com"}, false};
+  EXPECT_TRUE(webdav::cors_allows_origin(implicit_policy, "https://app.example.com"));
+
+  const webdav::User full_origin{"alice", "hash", "/tmp", {"https://app.example.com/"}};
+  EXPECT_TRUE(webdav::cors_allows_origin(full_origin, "https://app.example.com"));
+  EXPECT_FALSE(webdav::cors_allows_origin(full_origin, "http://app.example.com"));
+  EXPECT_FALSE(webdav::cors_allows_origin(full_origin, "https://app.example.com/"));
+
+  const webdav::User empty_rule{"alice", "hash", "/tmp", {""}};
+  EXPECT_FALSE(webdav::cors_allows_origin(empty_rule, "https://app.example.com"));
+
+  const webdav::User bare{"alice", "hash", "/tmp", {"app.example.com"}};
+  EXPECT_TRUE(webdav::cors_allows_origin(bare, "https://app.example.com:8443"));
+  EXPECT_FALSE(webdav::cors_allows_origin(bare, "https://other.example.com"));
+  EXPECT_FALSE(webdav::cors_allows_origin(bare, "app.example.com"));
+  EXPECT_FALSE(webdav::cors_allows_origin(bare, "://app.example.com"));
+  EXPECT_FALSE(webdav::cors_allows_origin(bare, "https://"));
+  EXPECT_FALSE(webdav::cors_allows_origin(bare, "https://app.example.com/path"));
+  EXPECT_FALSE(webdav::cors_allows_origin(bare, "https://[::1"));
+  EXPECT_FALSE(webdav::cors_allows_origin(bare, "https://:8080"));
+
+  const webdav::User wildcard{"alice", "hash", "/tmp", {"*.example.com"}};
+  EXPECT_TRUE(webdav::cors_allows_origin(wildcard, "https://a.example.com"));
+  EXPECT_FALSE(webdav::cors_allows_origin(wildcard, "https://example.com"));
+  EXPECT_FALSE(webdav::cors_allows_origin(wildcard, "https://badexample.com"));
+
+  const webdav::User port{"alice", "hash", "/tmp", {"app.example.com:8443"}};
+  EXPECT_TRUE(webdav::cors_allows_origin(port, "https://app.example.com:8443"));
+  EXPECT_FALSE(webdav::cors_allows_origin(port, "https://app.example.com:9999"));
+
+  const webdav::User ipv6{"alice", "hash", "/tmp", {"[::1]"}};
+  EXPECT_TRUE(webdav::cors_allows_origin(ipv6, "http://[::1]:8080"));
+  EXPECT_FALSE(webdav::cors_allows_origin(ipv6, "http://[::1"));
+
+  const webdav::User ipv6_port{"alice", "hash", "/tmp", {"[::1]:8080"}};
+  EXPECT_TRUE(webdav::cors_allows_origin(ipv6_port, "http://[::1]:8080"));
+  EXPECT_FALSE(webdav::cors_allows_origin(ipv6_port, "http://[::1]:9090"));
+
+  const webdav::User whitespace{"alice", "hash", "/tmp", {"  app.example.com\t"}};
+  EXPECT_TRUE(webdav::cors_allows_origin(whitespace, "https://app.example.com"));
 }
 
 TEST(Config, RejectsInvalidJson) {
@@ -142,6 +241,18 @@ TEST(Config, RejectsUnknownUserKey) {
   expect_error(config_json("{\"name\":\"a\",\"password_bcrypt\":\"" + std::string(kHash) +
                            "\",\"root\":\"/tmp\",\"extra\":1}"),
                "unknown user key 'extra'");
+}
+
+TEST(Config, RejectsInvalidCorsDomains) {
+  const std::string alice = make_dir("cors_invalid_alice");
+  expect_error(config_json(user_entry_with_cors("alice", kHash, alice, "\"x\"")),
+               "'cors_domains' must be an array");
+  expect_error(config_json(user_entry_with_cors("alice", kHash, alice, "[1]")),
+               "'cors_domains' entries must be strings");
+  expect_error(config_json(user_entry_with_cors("alice", kHash, alice, "[\"\"]")),
+               "'cors_domains' entries must not be empty");
+  expect_error(config_json(user_entry_with_cors("alice", kHash, alice, "[\"line\\nfeed\"]")),
+               "must not contain control characters");
 }
 
 TEST(Config, RejectsBadBcrypt) {

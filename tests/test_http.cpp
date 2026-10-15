@@ -105,6 +105,7 @@ TEST(HttpTest, ReasonPhrases) {
   EXPECT_STREQ(webdav::reason_phrase(http::status::ok), "OK");
   EXPECT_STREQ(webdav::reason_phrase(http::status::created), "Created");
   EXPECT_STREQ(webdav::reason_phrase(http::status::no_content), "No Content");
+  EXPECT_STREQ(webdav::reason_phrase(http::status::not_modified), "Not Modified");
   EXPECT_STREQ(webdav::reason_phrase(http::status::partial_content), "Partial Content");
   EXPECT_STREQ(webdav::reason_phrase(http::status::multi_status), "Multi-Status");
   EXPECT_STREQ(webdav::reason_phrase(http::status::bad_request), "Bad Request");
@@ -525,4 +526,25 @@ TEST(HttpTest, BodyReaderRejectsAmbiguousTransferEncoding) {
     webdav::BodyReader body(reader, head);
     EXPECT_TRUE(body.failed());
   }
+}
+
+
+TEST(HttpTest, BodyReaderRejectsOversizedTrailerSection) {
+  SocketPair pair;
+  std::string wire = "0\r\n";
+  for (int i = 0; i < 80; ++i) {
+    wire += "X: " + std::string(100, 'a') + "\r\n";
+  }
+  ASSERT_TRUE(write_some(pair.b(), wire));
+
+  beast::flat_buffer buffer;
+  webdav::Reader reader(pair.a(), buffer);
+  http::request_header<> head;
+  head.set(http::field::transfer_encoding, "chunked");
+  webdav::BodyReader body(reader, head);
+
+  char out = 0;
+  std::size_t got = 0;
+  EXPECT_FALSE(body.read(&out, 1, got));
+  EXPECT_TRUE(body.failed());
 }

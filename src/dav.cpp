@@ -39,6 +39,7 @@ http::status status_for_errno(int error, bool allow_conflict) {
       return http::status::not_found;
     case EACCES:
     case EPERM:
+    case EINVAL:
     case kTreeSymlink:
     case kTreeDepthExceeded:
       return http::status::forbidden;
@@ -63,6 +64,93 @@ void method_not_allowed(Response& response) {
 std::string header_value(const http::request_header<>& head, http::field field) {
   const auto value = head[field];
   return std::string(value.data(), value.size());
+}
+
+std::string_view trim_ascii(std::string_view text) {
+  while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) {
+    text.remove_prefix(1);
+  }
+  while (!text.empty() && (text.back() == ' ' || text.back() == '\t')) {
+    text.remove_suffix(1);
+  }
+  return text;
+}
+
+std::string_view strip_weak_prefix(std::string_view tag) {
+  if (tag.size() >= 2 && tag[0] == 'W' && tag[1] == '/') {
+    tag.remove_prefix(2);
+  }
+  return tag;
+}
+
+// Matches a comma-separated If-Match / If-None-Match value. This project's
+// ETags never contain commas, so a small parser is sufficient and keeps the
+// hot path allocation-free.
+bool etag_list_matches(std::string_view value, bool target_exists,
+                       std::string_view current_etag, bool strong) {
+  if (trim_ascii(value) == "*") {
+    return target_exists;
+  }
+  if (!target_exists) {
+    return false;
+  }
+  std::size_t start = 0;
+  while (start <= value.size()) {
+    const std::size_t comma = value.find(',', start);
+    const std::string_view token =
+        trim_ascii(comma == std::string_view::npos ? value.substr(start)
+                                                   : value.substr(start, comma - start));
+    const std::string_view candidate = strong ? token : strip_weak_prefix(token);
+    if (candidate == current_etag) {
+      return true;
+    }
+    if (comma == std::string_view::npos) {
+      break;
+    }
+    start = comma + 1;
+  }
+  return false;
+}
+
+enum class ConditionalResult { kProceed, kFailed, kNotModified };
+
+std::string etag_for(const Target& target) {
+  return format_etag(static_cast<std::uint64_t>(target.info.st_size), target.info.st_mtim);
+}
+
+ConditionalResult evaluate_conditional(const Target& target,
+                                       const http::request_header<>& head,
+                                       bool get_or_head) {
+  const std::string current_etag = target.exists ? etag_for(target) : std::string();
+  const auto if_match = head[http::field::if_match];
+  if (!if_match.empty()) {
+    const std::string_view value(if_match.data(), if_match.size());
+    if (!etag_list_matches(value, target.exists, current_etag, true)) {
+      return ConditionalResult::kFailed;
+    }
+  }
+  const auto if_none_match = head[http::field::if_none_match];
+  if (!if_none_match.empty()) {
+    const std::string_view value(if_none_match.data(), if_none_match.size());
+    if (etag_list_matches(value, target.exists, current_etag, false)) {
+      return get_or_head ? ConditionalResult::kNotModified : ConditionalResult::kFailed;
+    }
+  }
+  return ConditionalResult::kProceed;
+}
+
+void send_precondition_failed(Response& response, bool close_connection) {
+  if (close_connection) {
+    response.set_keep_alive(false);
+  }
+  (void)response.send_text(http::status::precondition_failed, "Precondition Failed\n");
+}
+
+void send_not_modified(Response& response, const Target& target) {
+  response.result(http::status::not_modified);
+  response.set("ETag", etag_for(target));
+  response.set("Last-Modified", format_http_date(target.info.st_mtime));
+  (void)response.write_head();
 }
 
 bool iequals(std::string_view a, std::string_view b) {
@@ -427,6 +515,15 @@ void handle_get(DavContext& ctx, Response& response, bool head_only) {
     (void)response.send_text(status_for_path(target.status, false), "Error\n");
     return;
   }
+  const ConditionalResult conditional = evaluate_conditional(target, ctx.head, true);
+  if (conditional == ConditionalResult::kFailed) {
+    send_precondition_failed(response, false);
+    return;
+  }
+  if (conditional == ConditionalResult::kNotModified) {
+    send_not_modified(response, target);
+    return;
+  }
   const bool collection = target.is_root || S_ISDIR(target.info.st_mode);
   if (collection || !target.exists) {
     if (collection) {
@@ -522,6 +619,10 @@ void handle_put(DavContext& ctx, Response& response) {
     (void)response.send_text(http::status::length_required, "Length Required\n");
     return;
   }
+  if (evaluate_conditional(target, ctx.head, false) == ConditionalResult::kFailed) {
+    send_precondition_failed(response, true);
+    return;
+  }
 
   const unsigned serial = g_temp_counter.fetch_add(1);
   char temp_name[64];
@@ -581,6 +682,10 @@ void handle_put(DavContext& ctx, Response& response) {
     (void)response.send_text(status_for_errno(error, false), "Rename failed\n");
     return;
   }
+  struct stat written {};
+  if (fs_fstatat(target.parent.get(), target.leaf.c_str(), &written, AT_SYMLINK_NOFOLLOW) == 0) {
+    response.set("ETag", format_etag(static_cast<std::uint64_t>(written.st_size), written.st_mtim));
+  }
   response.result(target.exists ? http::status::no_content : http::status::created);
   response.set("Content-Length", "0");
   (void)response.write_head();
@@ -598,6 +703,10 @@ void handle_delete(DavContext& ctx, Response& response) {
   }
   if (!target.exists) {
     (void)response.send_text(http::status::not_found, "Not Found\n");
+    return;
+  }
+  if (evaluate_conditional(target, ctx.head, false) == ConditionalResult::kFailed) {
+    send_precondition_failed(response, ctx.body.has_body());
     return;
   }
   if (ctx.body.has_body()) {
@@ -812,6 +921,10 @@ void handle_copy_move(DavContext& ctx, Response& response, bool move) {
     (void)response.send_text(http::status::not_found, "Not Found\n");
     return;
   }
+  if (evaluate_conditional(source, ctx.head, false) == ConditionalResult::kFailed) {
+    send_precondition_failed(response, ctx.body.has_body());
+    return;
+  }
   if (ctx.body.has_body()) {
     response.set_keep_alive(false);
   }
@@ -839,6 +952,10 @@ void handle_copy_move(DavContext& ctx, Response& response, bool move) {
   }
 
   const bool source_is_collection = S_ISDIR(source.info.st_mode);
+  if (!source_is_collection && !S_ISREG(source.info.st_mode)) {
+    (void)response.send_text(http::status::forbidden, "Non-regular source is not supported\n");
+    return;
+  }
   if (source.decoded_path == target.decoded_path) {
     (void)response.send_text(http::status::forbidden, "Source and destination are identical\n");
     return;
@@ -905,6 +1022,11 @@ void handle_copy_move(DavContext& ctx, Response& response, bool move) {
 }  // namespace
 
 void handle_dav_request(DavContext& ctx, Response& response) {
+  if (ctx.body.failed()) {
+    response.set_keep_alive(false);
+    (void)response.send_text(http::status::bad_request, "Bad Request\n");
+    return;
+  }
   const std::string_view method = ctx.head.method_string();
   if (method == "OPTIONS") {
     handle_options(response);

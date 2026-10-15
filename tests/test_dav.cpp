@@ -340,8 +340,8 @@ class DavTest : public ::testing::Test {
     config.auth_backoff_base_ms = 1;
     config.auth_backoff_max_ms = 1;
     const std::string hash = bcrypt_hash(kPassword, "$2b$10$abcdefghijklmnopqrstuu");
-    config.users.push_back(webdav::User{"alice", hash, root_alice_});
-    config.users.push_back(webdav::User{"bob", hash, root_bob_});
+    config.users.push_back(webdav::User{"alice", hash, root_alice_, {"https://alice.example"}});
+    config.users.push_back(webdav::User{"bob", hash, root_bob_, {"https://bob.example"}});
 
     auto authenticator = std::make_shared<webdav::Authenticator>(
         config.users, config.auth_max_concurrent, config.auth_backoff_base_ms,
@@ -411,6 +411,196 @@ TEST_F(DavTest, RejectsWrongPasswordAndUnknownUser) {
   EXPECT_EQ(unknown_user.request_as("OPTIONS", "/", "nobody", "nope", "").status, 401);
 }
 
+TEST_F(DavTest, CorsAllowsListedOrigin) {
+  const std::string origin = "https://alice.example";
+  const Response response = send("GET", "/hello.txt", {{"Origin", origin}});
+  EXPECT_EQ(response.status, 200);
+  EXPECT_EQ(response.body, "hello world");
+  EXPECT_EQ(response.header("Access-Control-Allow-Origin"), origin);
+  EXPECT_EQ(response.header("Access-Control-Allow-Credentials"), "true");
+  EXPECT_EQ(response.header("Access-Control-Allow-Methods"),
+            "GET, PUT, DELETE, OPTIONS, PROPFIND, MKCOL");
+  EXPECT_EQ(response.header("Access-Control-Allow-Headers"),
+            "Authorization, Content-Type, Depth, If-Match, If-None-Match");
+  EXPECT_EQ(response.header("Access-Control-Expose-Headers"),
+            "ETag, DAV, MS-Author-Via, Allow");
+  EXPECT_NE(response.header("Vary").find("Origin"), std::string::npos);
+}
+
+TEST_F(DavTest, CorsHeadersOnActualPutAndHeadResponses) {
+  const std::string origin = "https://alice.example";
+  const Response put = send("PUT", "/cors-actual.txt", {{"Origin", origin}}, "data");
+  EXPECT_EQ(put.status, 201);
+  EXPECT_EQ(put.header("Access-Control-Allow-Origin"), origin);
+  EXPECT_EQ(put.header("Access-Control-Allow-Methods"),
+            "GET, PUT, DELETE, OPTIONS, PROPFIND, MKCOL");
+  EXPECT_EQ(put.header("Access-Control-Expose-Headers"),
+            "ETag, DAV, MS-Author-Via, Allow");
+
+  const Response replaced = send("PUT", "/cors-actual.txt", {{"Origin", origin}}, "updated");
+  EXPECT_EQ(replaced.status, 204);
+  EXPECT_EQ(replaced.header("Access-Control-Allow-Origin"), origin);
+
+  const Response head = send("HEAD", "/cors-actual.txt", {{"Origin", origin}}, "", true);
+  EXPECT_EQ(head.status, 200);
+  EXPECT_EQ(head.header("Access-Control-Allow-Origin"), origin);
+  EXPECT_EQ(head.header("Access-Control-Allow-Headers"),
+            "Authorization, Content-Type, Depth, If-Match, If-None-Match");
+}
+
+TEST_F(DavTest, CorsUnlistedOriginGetsNormalResponseWithoutCorsHeaders) {
+  // Fetch leaves the blocking to the browser: an Origin outside the allowlist
+  // must not turn the request into an error, it only strips the
+  // Access-Control-* headers from an otherwise ordinary response.
+  const Response response =
+      send("PUT", "/cors-unlisted.txt", {{"Origin", "https://evil.example"}}, "evil");
+  EXPECT_EQ(response.status, 201);
+  EXPECT_EQ(read_file(root_alice_ + "/cors-unlisted.txt"), "evil");
+  EXPECT_TRUE(response.header("Access-Control-Allow-Origin").empty());
+  EXPECT_TRUE(response.header("Access-Control-Allow-Methods").empty());
+  EXPECT_TRUE(response.header("Access-Control-Allow-Headers").empty());
+  EXPECT_TRUE(response.header("Access-Control-Expose-Headers").empty());
+  EXPECT_NE(response.header("Vary").find("Origin"), std::string::npos);
+
+  const Response fetched = send("GET", "/cors-unlisted.txt", {{"Origin", "https://evil.example"}});
+  EXPECT_EQ(fetched.status, 200);
+  EXPECT_EQ(fetched.body, "evil");
+  EXPECT_TRUE(fetched.header("Access-Control-Allow-Origin").empty());
+}
+
+TEST_F(DavTest, CorsAllowlistIsPerAuthenticatedUser) {
+  // https://alice.example is listed only for alice. The bob request from that
+  // Origin still succeeds; only the browser is told not to show it.
+  Client client(port_);
+  std::string raw = "GET /secret.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: ";
+  raw.append(basic_auth("bob", kPassword));
+  raw.append("\r\nOrigin: https://alice.example\r\nConnection: close\r\n\r\n");
+  const Response response = client.send_raw(raw, false);
+  EXPECT_EQ(response.status, 200);
+  EXPECT_EQ(response.body, "bob-secret");
+  EXPECT_TRUE(response.header("Access-Control-Allow-Origin").empty());
+  EXPECT_NE(response.header("Vary").find("Origin"), std::string::npos);
+}
+
+TEST_F(DavTest, CorsHeadersOnErrorResponses) {
+  // A 401/404 stays readable for an allowed Origin, so the application sees the
+  // status code instead of an opaque network failure.
+  {
+    Client client(port_);
+    std::string raw = "GET /hello.txt HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                      "Origin: https://alice.example\r\nConnection: close\r\n\r\n";
+    const Response response = client.send_raw(raw, false);
+    EXPECT_EQ(response.status, 401);
+    EXPECT_EQ(response.header("Access-Control-Allow-Origin"), "https://alice.example");
+    EXPECT_EQ(response.header("Access-Control-Expose-Headers"),
+            "ETag, DAV, MS-Author-Via, Allow");
+  }
+  {
+    const Response response = send("GET", "/missing.txt", {{"Origin", "https://alice.example"}});
+    EXPECT_EQ(response.status, 404);
+    EXPECT_EQ(response.header("Access-Control-Allow-Origin"), "https://alice.example");
+    EXPECT_NE(response.header("Vary").find("Origin"), std::string::npos);
+  }
+}
+
+TEST_F(DavTest, CorsExposesDavCapabilityHeaders) {
+  // A scripted WebDAV capability probe reads `DAV` (and usually `Allow`) from an
+  // OPTIONS response. Browser JS only sees CORS-safelisted response headers plus
+  // whatever Access-Control-Expose-Headers lists, so both must be exposed or the
+  // probe wrongly concludes that the server is not a WebDAV server.
+  const Response response = send("OPTIONS", "/", {{"Origin", "https://alice.example"}});
+  EXPECT_EQ(response.status, 200);
+  EXPECT_EQ(response.header("DAV"), "1");
+  EXPECT_NE(response.header("Allow").find("PROPFIND"), std::string::npos);
+  const std::string exposed = response.header("Access-Control-Expose-Headers");
+  for (const char* name : {"ETag", "DAV", "MS-Author-Via", "Allow"}) {
+    EXPECT_NE(exposed.find(name), std::string::npos) << name;
+  }
+}
+
+TEST_F(DavTest, CorsPreflightForListedOriginSucceedsWithoutAuthentication) {
+  Client client(port_);
+  std::string raw = "OPTIONS / HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://alice.example\r\n"
+                    "Access-Control-Request-Method: PROPFIND\r\n\r\n";
+  const Response response = client.send_raw(raw, false);
+  EXPECT_EQ(response.status, 204);
+  EXPECT_EQ(response.header("Access-Control-Allow-Origin"), "https://alice.example");
+  EXPECT_EQ(response.header("Access-Control-Allow-Credentials"), "true");
+  EXPECT_EQ(response.header("Access-Control-Allow-Methods"),
+            "GET, PUT, DELETE, OPTIONS, PROPFIND, MKCOL");
+  EXPECT_EQ(response.header("Access-Control-Allow-Headers"),
+            "Authorization, Content-Type, Depth, If-Match, If-None-Match");
+  EXPECT_EQ(response.header("Access-Control-Expose-Headers"),
+            "ETag, DAV, MS-Author-Via, Allow");
+  EXPECT_EQ(response.header("Access-Control-Max-Age"), "86400");
+  EXPECT_NE(response.header("Vary").find("Origin"), std::string::npos);
+  EXPECT_NE(response.header("Allow").find("PROPFIND"), std::string::npos);
+  EXPECT_EQ(response.header("DAV"), "1");
+  EXPECT_EQ(response.header("MS-Author-Via"), "DAV");
+}
+
+TEST_F(DavTest, CorsPreflightIgnoresSuppliedCredentials) {
+  // Browsers never send credentials on a preflight; even a bogus Authorization
+  // header must not turn it into a 401.
+  Client client(port_);
+  std::string raw = "OPTIONS / HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                    "Authorization: Basic bm9wZTpub3Bl\r\nOrigin: https://alice.example\r\n"
+                    "Access-Control-Request-Method: PUT\r\nConnection: close\r\n\r\n";
+  const Response response = client.send_raw(raw, false);
+  EXPECT_EQ(response.status, 204);
+  EXPECT_EQ(response.header("Access-Control-Allow-Origin"), "https://alice.example");
+}
+
+TEST_F(DavTest, CorsPreflightConsultsEveryUsersAllowlist) {
+  // A preflight carries no credentials, so it cannot name the user that will
+  // follow: any user's allowlist may answer it. The follow-up request is still
+  // authenticated and checked against that user's own list.
+  Client client(port_);
+  std::string raw = "OPTIONS / HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://bob.example\r\n"
+                    "Access-Control-Request-Method: GET\r\nConnection: close\r\n\r\n";
+  const Response response = client.send_raw(raw, false);
+  EXPECT_EQ(response.status, 204);
+  EXPECT_EQ(response.header("Access-Control-Allow-Origin"), "https://bob.example");
+}
+
+TEST_F(DavTest, CorsPreflightForUnlistedOriginIsAnsweredWithoutCorsHeaders) {
+  Client client(port_);
+  std::string raw = "OPTIONS / HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://evil.example\r\n"
+                    "Access-Control-Request-Method: PROPFIND\r\nConnection: close\r\n\r\n";
+  const Response response = client.send_raw(raw, false);
+  EXPECT_EQ(response.status, 204);
+  EXPECT_TRUE(response.header("Access-Control-Allow-Origin").empty());
+  EXPECT_TRUE(response.header("Access-Control-Allow-Methods").empty());
+  EXPECT_TRUE(response.header("Access-Control-Allow-Headers").empty());
+  EXPECT_TRUE(response.header("Access-Control-Expose-Headers").empty());
+  EXPECT_TRUE(response.header("Access-Control-Max-Age").empty());
+  EXPECT_NE(response.header("Vary").find("Origin"), std::string::npos);
+  EXPECT_NE(response.header("Allow").find("PROPFIND"), std::string::npos);
+  EXPECT_EQ(response.header("DAV"), "1");
+}
+
+TEST_F(DavTest, OriginHeaderAloneDoesNotBypassAuthentication) {
+  // Without Access-Control-Request-Method this is an ordinary OPTIONS request,
+  // not a preflight, so it still requires credentials.
+  Client client(port_);
+  std::string raw = "OPTIONS / HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://alice.example\r\n"
+                    "Connection: close\r\n\r\n";
+  const Response response = client.send_raw(raw, false);
+  EXPECT_EQ(response.status, 401);
+  EXPECT_EQ(response.header("Access-Control-Allow-Origin"), "https://alice.example");
+}
+
+TEST_F(DavTest, CorsPreflightWriteHeadFailureClosesConnection) {
+  ScopedFaultHook guard([](const char* operation) {
+    return std::strcmp(operation, "http_write") == 0 ? EIO : 0;
+  });
+  Client client(port_);
+  std::string raw = "OPTIONS / HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://alice.example\r\n"
+                    "Access-Control-Request-Method: PROPFIND\r\nConnection: close\r\n\r\n";
+  const Response response = client.send_raw(raw, false);
+  EXPECT_EQ(response.status, 0);
+}
+
 TEST_F(DavTest, GetReturnsFileWithMetadata) {
   const Response response = send("GET", "/hello.txt");
   EXPECT_EQ(response.status, 200);
@@ -427,6 +617,112 @@ TEST_F(DavTest, HeadOmitsBodyButKeepsLength) {
   EXPECT_EQ(response.status, 200);
   EXPECT_EQ(response.header("Content-Length"), "11");
   EXPECT_TRUE(response.body.empty());
+}
+
+TEST_F(DavTest, PutReturnsEtag) {
+  const Response created = send("PUT", "/etag-new.txt", {}, "etag-body");
+  ASSERT_EQ(created.status, 201);
+  const std::string etag = created.header("ETag");
+  ASSERT_FALSE(etag.empty());
+
+  const Response fetched = send("GET", "/etag-new.txt");
+  EXPECT_EQ(fetched.status, 200);
+  EXPECT_EQ(fetched.header("ETag"), etag);
+}
+
+TEST_F(DavTest, GetConditionalEtagHeaders) {
+  const Response initial = send("GET", "/hello.txt");
+  ASSERT_EQ(initial.status, 200);
+  const std::string etag = initial.header("ETag");
+  ASSERT_FALSE(etag.empty());
+
+  const Response not_modified = send("GET", "/hello.txt", {{"If-None-Match", etag}});
+  EXPECT_EQ(not_modified.status, 304);
+  EXPECT_TRUE(not_modified.body.empty());
+  EXPECT_EQ(not_modified.header("ETag"), etag);
+  EXPECT_FALSE(not_modified.header("Last-Modified").empty());
+
+  const Response star_not_modified = send("GET", "/hello.txt", {{"If-None-Match", "*"}});
+  EXPECT_EQ(star_not_modified.status, 304);
+
+  const Response wrong_if_match = send("GET", "/hello.txt", {{"If-Match", "\"wrong\""}});
+  EXPECT_EQ(wrong_if_match.status, 412);
+
+  const Response missing = send("GET", "/conditional-missing.txt", {{"If-None-Match", "*"}});
+  EXPECT_EQ(missing.status, 404);
+}
+
+TEST_F(DavTest, ConditionalHeaderListsAndWeakComparison) {
+  const Response initial = send("GET", "/hello.txt");
+  ASSERT_EQ(initial.status, 200);
+  const std::string initial_etag = initial.header("ETag");
+  ASSERT_FALSE(initial_etag.empty());
+
+  const std::string list_value = "\"bogus\"\t, \t" + initial_etag;
+  const Response replaced =
+      send("PUT", "/hello.txt", {{"If-Match", list_value}}, "conditional update");
+  EXPECT_EQ(replaced.status, 204);
+  EXPECT_EQ(read_file(root_alice_ + "/hello.txt"), "conditional update");
+
+  const Response current = send("GET", "/hello.txt");
+  ASSERT_EQ(current.status, 200);
+  const std::string current_etag = current.header("ETag");
+  const Response weak_not_modified =
+      send("GET", "/hello.txt", {{"If-None-Match", "W/" + current_etag}});
+  EXPECT_EQ(weak_not_modified.status, 304);
+}
+
+TEST_F(DavTest, PutConditionalFailuresReturn412) {
+  const Response initial = send("GET", "/hello.txt");
+  ASSERT_EQ(initial.status, 200);
+  const std::string etag = initial.header("ETag");
+  ASSERT_FALSE(etag.empty());
+
+  const Response wrong_if_match =
+      send("PUT", "/hello.txt", {{"If-Match", "\"wrong\""}}, "bad");
+  EXPECT_EQ(wrong_if_match.status, 412);
+  EXPECT_EQ(read_file(root_alice_ + "/hello.txt"), "hello world");
+
+  const Response weak_if_match =
+      send("PUT", "/hello.txt", {{"If-Match", "W/" + etag}}, "bad");
+  EXPECT_EQ(weak_if_match.status, 412);
+  EXPECT_EQ(read_file(root_alice_ + "/hello.txt"), "hello world");
+
+  const Response star_missing =
+      send("PUT", "/conditional-missing.txt", {{"If-Match", "*"}}, "bad");
+  EXPECT_EQ(star_missing.status, 412);
+  EXPECT_FALSE(fs::exists(root_alice_ + "/conditional-missing.txt"));
+
+  const Response none_match_existing =
+      send("PUT", "/hello.txt", {{"If-None-Match", "*"}}, "bad");
+  EXPECT_EQ(none_match_existing.status, 412);
+  EXPECT_EQ(read_file(root_alice_ + "/hello.txt"), "hello world");
+
+  const Response specific_tag_missing =
+      send("PUT", "/conditional-missing.txt", {{"If-Match", "\"missing\""}}, "new");
+  EXPECT_EQ(specific_tag_missing.status, 412);
+  EXPECT_FALSE(fs::exists(root_alice_ + "/conditional-missing.txt"));
+}
+
+TEST_F(DavTest, PutIfNoneMatchStarCreatesMissingResource) {
+  const Response created =
+      send("PUT", "/conditional-created.txt", {{"If-None-Match", "*"}}, "created");
+  EXPECT_EQ(created.status, 201);
+  EXPECT_FALSE(created.header("ETag").empty());
+  EXPECT_EQ(read_file(root_alice_ + "/conditional-created.txt"), "created");
+}
+
+TEST_F(DavTest, DeleteAndCopyHonorConditionalHeaders) {
+  const Response deleted =
+      send("DELETE", "/hello.txt", {{"If-Match", "\"wrong\""}});
+  EXPECT_EQ(deleted.status, 412);
+  EXPECT_TRUE(fs::exists(root_alice_ + "/hello.txt"));
+
+  const Response copied = send("COPY", "/hello.txt",
+                               {{"Destination", "/conditional-copy.txt"},
+                                {"If-Match", "\"wrong\""}});
+  EXPECT_EQ(copied.status, 412);
+  EXPECT_FALSE(fs::exists(root_alice_ + "/conditional-copy.txt"));
 }
 
 TEST_F(DavTest, GetOnCollectionIsMethodNotAllowed) {
@@ -695,8 +991,116 @@ TEST(DavServer, UnknownAuthenticatedRootIsInternalError) {
   server.bind();
   std::thread thread([&server] { server.serve(); });
   Client client(server.port());
-  const Response response = client.request_as("OPTIONS", "/", "alice", kPassword, "");
+  std::string raw = "OPTIONS / HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: ";
+  raw.append(basic_auth("alice", kPassword));
+  raw.append("\r\nOrigin: https://alice.example\r\nConnection: close\r\n\r\n");
+  const Response response = client.send_raw(raw, false);
   EXPECT_EQ(response.status, 500);
+  // The server has no user to consult (its own config is empty), so the Origin
+  // is not allowed - but the request is still answered, never rejected.
+  EXPECT_TRUE(response.header("Access-Control-Allow-Origin").empty());
+  EXPECT_NE(response.header("Vary").find("Origin"), std::string::npos);
+  server.stop();
+  thread.join();
+}
+
+TEST(DavServer, CorsWithoutAllowlistAnswersNormallyWithoutCorsHeaders) {
+  const std::string root = make_root("cors_no_policy");
+  write_file(root + "/file.txt", "x");
+
+  webdav::Config config;
+  config.host = "127.0.0.1";
+  config.port = 0;
+  config.max_connections = 2;
+  const std::string hash = bcrypt_hash(kPassword, "$2b$10$abcdefghijklmnopqrstuu");
+  config.users.push_back(webdav::User{"alice", hash, root});
+
+  auto authenticator = std::make_shared<webdav::Authenticator>(
+      config.users, config.auth_max_concurrent, 1, 1, webdav::default_verify(),
+      [](std::chrono::milliseconds) {});
+  webdav::Server server(config, authenticator);
+  server.bind();
+  std::thread thread([&server] { server.serve(); });
+
+  {
+    Client client(server.port());
+    const Response browser =
+        client.request("GET", "/file.txt", {{"Origin", "https://app.example.com"}}, "", false);
+    EXPECT_EQ(browser.status, 200);
+    EXPECT_EQ(browser.body, "x");
+    EXPECT_TRUE(browser.header("Access-Control-Allow-Origin").empty());
+    EXPECT_NE(browser.header("Vary").find("Origin"), std::string::npos);
+  }
+  {
+    Client client(server.port());
+    const Response plain = client.request("GET", "/file.txt", {}, "", false);
+    EXPECT_EQ(plain.status, 200);
+    EXPECT_EQ(plain.body, "x");
+    EXPECT_TRUE(plain.header("Vary").empty());
+  }
+  {
+    Client client(server.port());
+    std::string raw =
+        "OPTIONS / HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://app.example.com\r\n"
+        "Access-Control-Request-Method: GET\r\nConnection: close\r\n\r\n";
+    const Response preflight = client.send_raw(raw, false);
+    EXPECT_EQ(preflight.status, 204);
+    EXPECT_TRUE(preflight.header("Access-Control-Allow-Origin").empty());
+  }
+
+  server.stop();
+  thread.join();
+}
+
+TEST(DavServer, FileOperationsUseProcessCredentialsNotConfiguredName) {
+  // A configured `name` is a WebDAV login, not an OS account. Make the root
+  // private to the current process and use a name that cannot resolve to an OS
+  // account: if the server changed credentials to `name`, both requests would
+  // fail before any filesystem operation.
+  const std::string name = "webdav-no-such-os-account-" + std::to_string(::getpid());
+  const std::string root = make_root("process_credentials");
+  ASSERT_EQ(::chmod(root.c_str(), 0700), 0);
+  write_file(root + "/existing.txt", "process-owned");
+  ASSERT_EQ(::chmod((root + "/existing.txt").c_str(), 0600), 0);
+
+  webdav::Config config;
+  config.host = "127.0.0.1";
+  config.port = 0;
+  config.max_connections = 2;
+  const std::string hash = bcrypt_hash(kPassword, "$2b$10$abcdefghijklmnopqrstuu");
+  config.users.push_back(webdav::User{name, hash, root});
+
+  auto authenticator = std::make_shared<webdav::Authenticator>(
+      config.users, config.auth_max_concurrent, 1, 1, webdav::default_verify(),
+      [](std::chrono::milliseconds) {});
+  webdav::Server server(config, authenticator);
+  server.bind();
+  std::thread thread([&server] { server.serve(); });
+
+  {
+    Client client(server.port());
+    const Response get = client.request_as("GET", "/existing.txt", name, kPassword, "");
+    EXPECT_EQ(get.status, 200);
+    EXPECT_EQ(get.body, "process-owned");
+  }
+
+  {
+    Client client(server.port());
+    std::string raw = "PUT /created.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: ";
+    raw.append(basic_auth(name, kPassword));
+    raw.append("\r\nContent-Length: 7\r\nConnection: close\r\n\r\ncreated");
+    const Response put = client.send_raw(raw, false);
+    EXPECT_EQ(put.status, 201);
+  }
+
+  struct stat created {};
+  const int stat_rc = ::stat((root + "/created.txt").c_str(), &created);
+  EXPECT_EQ(stat_rc, 0);
+  if (stat_rc == 0) {
+    EXPECT_EQ(created.st_uid, ::geteuid());
+    EXPECT_EQ(created.st_gid, ::getegid());
+  }
+
   server.stop();
   thread.join();
 }
@@ -1387,4 +1791,53 @@ TEST_F(DavTest, CopyAndMoveRejectAncestorDestination) {
 
 TEST_F(DavTest, ForwardedClientIpHeaderIsAcceptedForAuthBookkeeping) {
   EXPECT_EQ(send("OPTIONS", "/", {{"X-Real-IP", "203.0.113.9"}}).status, 200);
+}
+
+
+TEST_F(DavTest, RejectsMalformedBodyFramingBeforeDispatch) {
+  const std::string auth = basic_auth("alice", kPassword);
+  {
+    Client client(port_);
+    std::string raw = "MKCOL /framing-pwn HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: ";
+    raw += auth;
+    raw += "\r\nContent-Length: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const Response response = client.send_raw(raw, false);
+    EXPECT_EQ(response.status, 400);
+    EXPECT_FALSE(fs::exists(root_alice_ + "/framing-pwn"));
+  }
+  {
+    Client client(port_);
+    std::string raw = "DELETE /hello.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: ";
+    raw += auth;
+    raw += "\r\nTransfer-Encoding: identity\r\nConnection: close\r\n\r\n";
+    const Response response = client.send_raw(raw, false);
+    EXPECT_EQ(response.status, 400);
+    EXPECT_TRUE(fs::exists(root_alice_ + "/hello.txt"));
+  }
+}
+
+TEST_F(DavTest, CopyAndMoveRejectNonRegularSources) {
+  const std::string fifo = root_alice_ + "/fifo";
+  ASSERT_EQ(::mkfifo(fifo.c_str(), 0600), 0);
+  EXPECT_EQ(send("COPY", "/fifo", {{"Destination", "/fifo-copy"}}).status, 403);
+  EXPECT_EQ(send("MOVE", "/fifo", {{"Destination", "/fifo-moved"}}).status, 403);
+  EXPECT_TRUE(fs::exists(fifo));
+
+  const std::string child_fifo = root_alice_ + "/dir/fifo-child";
+  ASSERT_EQ(::mkfifo(child_fifo.c_str(), 0600), 0);
+  EXPECT_EQ(send("COPY", "/dir", {{"Destination", "/dir-with-fifo"}}).status, 403);
+  EXPECT_TRUE(fs::exists(child_fifo));
+}
+
+TEST_F(DavTest, RejectsOversizedChunkedTrailerSection) {
+  Client client(port_);
+  std::string raw = "PROPFIND /hello.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: ";
+  raw += basic_auth("alice", kPassword);
+  raw += "\r\nDepth: 0\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n";
+  for (int i = 0; i < 80; ++i) {
+    raw += "X: " + std::string(100, 'a') + "\r\n";
+  }
+  raw += "\r\n";
+  const Response response = client.send_raw(raw, false);
+  EXPECT_EQ(response.status, 400);
 }

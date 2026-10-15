@@ -103,6 +103,7 @@ inline constexpr int kMaxTreeDepth = 64;
 // Signals used by the tree helpers, on top of plain errno values.
 inline constexpr int kTreeDepthExceeded = E2BIG;
 inline constexpr int kTreeSymlink = ELOOP;
+inline constexpr int kTreeNotRegular = EINVAL;
 
 // Removes `parent/leaf`, recursing into directories. Returns 0 or an errno.
 int remove_tree(const Fd& parent, const std::string& leaf, int depth = 0);

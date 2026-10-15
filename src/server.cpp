@@ -31,6 +31,50 @@ namespace webdav {
 
 using tcp = asio::ip::tcp;
 
+namespace {
+
+// Browser CORS policy.  `Origin` only decides whether the browser may *read* a
+// response: the server answers every request normally and merely omits the
+// `Access-Control-*` headers for an Origin outside the allowlist, leaving the
+// blocking to the browser.  An unlisted Origin must therefore never become a
+// 403 - that would be both non-conforming and indistinguishable, in the
+// browser, from a wrong server address.
+constexpr std::string_view kCorsAllowMethods = "GET, PUT, DELETE, OPTIONS, PROPFIND, MKCOL";
+constexpr std::string_view kCorsAllowHeaders =
+    "Authorization, Content-Type, Depth, If-Match, If-None-Match";
+// Browser scripts only see CORS-safelisted response headers plus the ones listed
+// here. A scripted WebDAV capability probe reads `DAV` and `Allow`, so both must
+// be exposed or the client concludes the server is not a WebDAV server.
+constexpr std::string_view kCorsExposeHeaders = "ETag, DAV, MS-Author-Via, Allow";
+
+// True when any configured user lists `origin`.  Used whenever no user is known
+// yet: a credential-less preflight and a 401 must be readable by the browser
+// even though the follow-up, authenticated request is what names the user.
+bool any_user_allows_origin(const Config& config, std::string_view origin) {
+  for (const User& user : config.users) {
+    if (cors_allows_origin(user, origin)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void set_cors_headers(Response& response, std::string_view origin) {
+  response.set("Access-Control-Allow-Origin", std::string(origin));
+  response.set("Access-Control-Allow-Credentials", "true");
+  response.set("Access-Control-Allow-Methods", std::string(kCorsAllowMethods));
+  response.set("Access-Control-Allow-Headers", std::string(kCorsAllowHeaders));
+  response.set("Access-Control-Expose-Headers", std::string(kCorsExposeHeaders));
+  response.set("Vary", "Origin");
+}
+
+void set_preflight_headers(Response& response, std::string_view origin) {
+  set_cors_headers(response, origin);
+  response.set("Access-Control-Max-Age", "86400");
+}
+
+}  // namespace
+
 struct Server::Impl {
   struct UserRoot {
     std::string name;
@@ -57,6 +101,29 @@ struct Server::Impl {
       }
     }
     return nullptr;
+  }
+
+  const User* user_for(const std::string& name) const {
+    for (const User& user : config.users) {
+      if (user.name == name) {
+        return &user;
+      }
+    }
+    return nullptr;
+  }
+
+  // Adds the CORS response headers when `origin` is allowed to read the answer,
+  // and `Vary: Origin` either way so a shared cache cannot hand one Origin's
+  // answer to another. `user` is null while no user is known (401/500, or a
+  // credential-less preflight); any configured allowlist then counts.
+  void apply_cors_headers(Response& response, const User* user, std::string_view origin) const {
+    const bool allowed = user != nullptr ? cors_allows_origin(*user, origin)
+                                         : any_user_allows_origin(config, origin);
+    if (allowed) {
+      set_cors_headers(response, origin);
+    } else {
+      response.set("Vary", "Origin");
+    }
   }
 
   Config config;
@@ -106,29 +173,69 @@ void Server::Impl::handle_connection(tcp::socket socket) {
       response.set_bodyless(true);
     }
 
+    // A browser CORS preflight is an OPTIONS request carrying both Origin and
+    // Access-Control-Request-Method.  Browsers never attach credentials to it,
+    // so it must be answered before authentication: requiring credentials here
+    // would make every cross-origin request impossible.  The preflight does not
+    // identify a user, so the Origin is checked against every configured
+    // allowlist; the follow-up request is still authenticated and judged by
+    // that user's own list.
+    const auto origin_field = head.find("origin");
+    const bool has_origin = origin_field != head.end();
+    std::string origin;
+    if (has_origin) {
+      origin.assign(origin_field->value().data(), origin_field->value().size());
+    }
+    if (head.method() == http::verb::options && has_origin &&
+        head.find("access-control-request-method") != head.end()) {
+      // A preflight is answered normally whether or not the Origin is listed;
+      // without the CORS headers the browser blocks the follow-up request.
+      response.result(http::status::no_content);
+      response.set("DAV", "1");
+      response.set("MS-Author-Via", "DAV");
+      response.set("Allow", std::string(kAllowMethods));
+      if (any_user_allows_origin(config, origin)) {
+        set_preflight_headers(response, origin);
+      } else {
+        response.set("Vary", "Origin");
+      }
+      if (!response.write_head()) {
+        break;
+      }
+      if (!response.keep_alive() || !body.complete()) {
+        break;
+      }
+      continue;
+    }
+
     const auto authorization = head[http::field::authorization];
     const AuthResult auth_result = auth->authenticate(
         client_key, std::string_view(authorization.data(), authorization.size()));
-    if (auth_result.status != AuthStatus::kOk) {
+    const bool authenticated = auth_result.status == AuthStatus::kOk;
+    const Fd* root = authenticated ? root_for(auth_result.user->name) : nullptr;
+    const User* configured_user = authenticated ? user_for(auth_result.user->name) : nullptr;
+    if (has_origin) {
+      apply_cors_headers(response, configured_user, origin);
+    }
+    if (!authenticated) {
       response.set("WWW-Authenticate", "Basic realm=\"webdav\", charset=\"UTF-8\"");
       (void)response.send_text(http::status::unauthorized, "Unauthorized\n");
+    } else if (root == nullptr || configured_user == nullptr) {
+      (void)response.send_text(http::status::internal_server_error, "Unknown root\n");
     } else {
-      const Fd* root = root_for(auth_result.user->name);
-      if (root == nullptr) {
-        (void)response.send_text(http::status::internal_server_error, "Unknown root\n");
-      } else {
-        if (head.version() == 11) {
-          const auto expect = head[http::field::expect];
-          const std::string_view expect_view(expect.data(), expect.size());
-          if (expect_view.find("100-continue") != std::string_view::npos) {
-            ErrorCode write_ec;
-            const char interim[] = "HTTP/1.1 100 Continue\r\n\r\n";
-            asio::write(socket, asio::buffer(interim, sizeof(interim) - 1), write_ec);
-          }
+      if (head.version() == 11) {
+        const auto expect = head[http::field::expect];
+        const std::string_view expect_view(expect.data(), expect.size());
+        if (expect_view.find("100-continue") != std::string_view::npos) {
+          ErrorCode write_ec;
+          const char interim[] = "HTTP/1.1 100 Continue\r\n\r\n";
+          asio::write(socket, asio::buffer(interim, sizeof(interim) - 1), write_ec);
         }
-        DavContext context{socket, head, body, *root, *auth_result.user};
-        handle_dav_request(context, response);
       }
+      // DAV handlers receive only the authenticated user's pre-opened root;
+      // they never receive or look up the configured `name` as an OS account.
+      DavContext context{socket, head, body, *root};
+      handle_dav_request(context, response);
     }
 
     if (!response.keep_alive() || !body.complete()) {
